@@ -18,12 +18,17 @@ from .evaluator import (
     EvaluationResult,
     EvaluationScalar,
     Evaluator,
+    ExperimentEvaluator,
     EvaluatorFailure,
     EvaluatorOutput,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from pydantic_ai.retries import RetryConfig
+
+    from ..reporting import ReportCase
 
 
 InputsT = TypeVar('InputsT', default=Any, contravariant=True)
@@ -109,3 +114,59 @@ def _convert_to_mapping(
     if isinstance(result, Mapping):
         return result
     return {scalar_name: result}
+
+
+async def run_experiment_evaluator(
+    evaluator: ExperimentEvaluator[InputsT, OutputT, MetadataT],
+    cases: Sequence[ReportCase[InputsT, OutputT, MetadataT]],
+    retry: RetryConfig | None = None,
+) -> list[EvaluationResult] | EvaluatorFailure:
+    """Run an experiment evaluator and return the results.
+
+    Args:
+        evaluator: The experiment evaluator to run.
+        cases: The results of all cases in the experiment.
+        retry: The retry configuration to use for running the evaluator.
+
+    Returns:
+        A list of evaluation results, or an evaluator failure if an exception is raised.
+    """
+    evaluate = evaluator.evaluate_experiment_async
+    if retry is not None:
+        # import from pydantic_ai.retries to trigger more descriptive import error if tenacity is missing
+        from pydantic_ai.retries import retry as tenacity_retry
+
+        evaluate = tenacity_retry(**retry)(evaluate)
+
+    try:
+        with logfire_span(
+            'experiment_evaluator: {evaluator_name}',
+            evaluator_name=evaluator.get_default_evaluation_name(),
+        ):
+            raw_results = await evaluate(cases)
+
+            try:
+                results = _EVALUATOR_OUTPUT_ADAPTER.validate_python(raw_results)
+            except ValidationError as e:
+                raise ValueError(
+                    f'{evaluator!r}.evaluate_experiment returned a value of an invalid type: {raw_results!r}.'
+                ) from e
+    except Exception as e:
+        return EvaluatorFailure(
+            name=evaluator.get_default_evaluation_name(),
+            error_message=f'{type(e).__name__}: {e}',
+            error_stacktrace=traceback.format_exc(),
+            source=evaluator.as_spec(),
+        )
+
+    results = _convert_to_mapping(results, scalar_name=evaluator.get_default_evaluation_name())
+
+    details: list[EvaluationResult] = []
+    for name, result in results.items():
+        if not isinstance(result, EvaluationReason):
+            result = EvaluationReason(value=result)
+        details.append(
+            EvaluationResult(name=name, value=result.value, reason=result.reason, source=evaluator.as_spec())
+        )
+
+    return details

@@ -37,8 +37,8 @@ from typing_extensions import NotRequired, Self, TypedDict, TypeVar
 from pydantic_evals._utils import get_event_loop
 
 from ._utils import get_unwrapped_function_name, logfire_span, task_group_gather
-from .evaluators import EvaluationResult, Evaluator
-from .evaluators._run_evaluator import run_evaluator
+from .evaluators import EvaluationResult, Evaluator, ExperimentEvaluator
+from .evaluators._run_evaluator import run_evaluator, run_experiment_evaluator
 from .evaluators.common import DEFAULT_EVALUATORS
 from .evaluators.context import EvaluatorContext
 from .evaluators.evaluator import EvaluatorFailure
@@ -101,6 +101,7 @@ class _DatasetModel(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forb
     name: str | None = None
     cases: list[_CaseModel[InputsT, OutputT, MetadataT]]
     evaluators: list[EvaluatorSpec] = Field(default_factory=list[EvaluatorSpec])
+    experiment_evaluators: list[EvaluatorSpec] = Field(default_factory=list[EvaluatorSpec])
 
 
 @dataclass(init=False)
@@ -227,6 +228,8 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
     """List of test cases in the dataset."""
     evaluators: list[Evaluator[InputsT, OutputT, MetadataT]] = []
     """List of evaluators to be used on all cases in the dataset."""
+    experiment_evaluators: list[ExperimentEvaluator[InputsT, OutputT, MetadataT]] = []
+    """List of evaluators to be used on the entire experiment results."""
 
     def __init__(
         self,
@@ -234,6 +237,7 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
         name: str | None = None,
         cases: Sequence[Case[InputsT, OutputT, MetadataT]],
         evaluators: Sequence[Evaluator[InputsT, OutputT, MetadataT]] = (),
+        experiment_evaluators: Sequence[ExperimentEvaluator[InputsT, OutputT, MetadataT]] = (),
     ):
         """Initialize a new dataset with test cases and optional evaluators.
 
@@ -254,6 +258,7 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
             name=name,
             cases=cases,
             evaluators=list(evaluators),
+            experiment_evaluators=list(experiment_evaluators),
         )
 
     # TODO in v2: Make everything not required keyword-only
@@ -265,6 +270,7 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
         progress: bool = True,
         retry_task: RetryConfig | None = None,
         retry_evaluators: RetryConfig | None = None,
+        retry_experiment_evaluators: RetryConfig | None = None,
         *,
         task_name: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -350,6 +356,30 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
                 span_id=span_id,
                 trace_id=trace_id,
             )
+
+            if self.experiment_evaluators:
+                experiment_evaluator_outputs_by_task = await task_group_gather(
+                    [
+                        lambda ev=ev: run_experiment_evaluator(ev, cases, retry_experiment_evaluators)
+                        for ev in self.experiment_evaluators
+                    ]
+                )
+                experiment_evaluator_outputs: list[EvaluationResult] = []
+                for outputs in experiment_evaluator_outputs_by_task:
+                    if isinstance(outputs, EvaluatorFailure):
+                        report.experiment_evaluator_failures.append(outputs)
+                    else:
+                        experiment_evaluator_outputs.extend(outputs)
+
+                assertions, scores, labels = _group_evaluator_outputs_by_type(experiment_evaluator_outputs)
+                report.experiment_assertions = assertions
+                report.experiment_scores = scores
+                report.experiment_labels = labels
+
+                eval_span.set_attribute('experiment_assertions', _evaluation_results_adapter.dump_python(assertions))
+                eval_span.set_attribute('experiment_scores', _evaluation_results_adapter.dump_python(scores))
+                eval_span.set_attribute('experiment_labels', _evaluation_results_adapter.dump_python(labels))
+
             full_experiment_metadata: dict[str, Any] = {'n_cases': len(self.cases)}
             if metadata is not None:
                 full_experiment_metadata['metadata'] = metadata
@@ -368,6 +398,7 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
         progress: bool = True,
         retry_task: RetryConfig | None = None,
         retry_evaluators: RetryConfig | None = None,
+        retry_experiment_evaluators: RetryConfig | None = None,
         *,
         task_name: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -386,6 +417,7 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
             progress: Whether to show a progress bar for the evaluation. Defaults to `True`.
             retry_task: Optional retry configuration for the task execution.
             retry_evaluators: Optional retry configuration for evaluator execution.
+            retry_experiment_evaluators: Optional retry configuration for experiment evaluator execution.
             task_name: Optional override to the name of the task being executed, otherwise the name of the task
                 function will be used.
             metadata: Optional dict of experiment metadata.
@@ -401,6 +433,7 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
                 progress=progress,
                 retry_task=retry_task,
                 retry_evaluators=retry_evaluators,
+                retry_experiment_evaluators=retry_experiment_evaluators,
                 task_name=task_name,
                 metadata=metadata,
             )
@@ -465,6 +498,17 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
                     added = True
             if not added:
                 raise ValueError(f'Case {specific_case!r} not found in the dataset')
+
+    def add_experiment_evaluator(
+        self,
+        evaluator: ExperimentEvaluator[InputsT, OutputT, MetadataT],
+    ) -> None:
+        """Adds an experiment-level evaluator to the dataset.
+
+        Args:
+            evaluator: The experiment-level evaluator to add.
+        """
+        self.experiment_evaluators.append(evaluator)
 
     @classmethod
     @functools.cache
@@ -592,26 +636,38 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
             default_name: Default name of the dataset, to be used if the value is `None` in the provided model.
 
         Returns:
-            A new Dataset instance created from the _DatasetModel.
+            A Dataset instance.
         """
-        registry = _get_registry(custom_evaluator_types)
+        registry = _get_registry(custom_evaluator_types, Evaluator, DEFAULT_EVALUATORS)
+        experiment_registry = _get_registry(
+            [t for t in custom_evaluator_types if issubclass(t, ExperimentEvaluator)], ExperimentEvaluator
+        )
 
         cases: list[Case[InputsT, OutputT, MetadataT]] = []
         errors: list[ValueError] = []
         dataset_evaluators: list[Evaluator] = []
         for spec in dataset_model.evaluators:
             try:
-                dataset_evaluator = _load_evaluator_from_registry(registry, None, spec)
+                dataset_evaluator = _load_evaluator_from_registry(registry, 'dataset', spec)
             except ValueError as e:
                 errors.append(e)
                 continue
             dataset_evaluators.append(dataset_evaluator)
 
+        dataset_experiment_evaluators: list[ExperimentEvaluator] = []
+        for spec in getattr(dataset_model, 'experiment_evaluators', []):
+            try:
+                experiment_evaluator = _load_evaluator_from_registry(experiment_registry, 'experiment', spec)
+            except ValueError as e:
+                errors.append(e)
+                continue
+            dataset_experiment_evaluators.append(experiment_evaluator)
+
         for row in dataset_model.cases:
             evaluators: list[Evaluator] = []
             for spec in row.evaluators:
                 try:
-                    evaluator = _load_evaluator_from_registry(registry, row.name, spec)
+                    evaluator = _load_evaluator_from_registry(registry, f'case {row.name!r}', spec)
                 except ValueError as e:
                     errors.append(e)
                     continue
@@ -630,6 +686,7 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
         if result.name is None:
             result.name = default_name
         result.evaluators = dataset_evaluators
+        result.experiment_evaluators = dataset_experiment_evaluators
         return result
 
     def to_file(
@@ -694,65 +751,68 @@ class Dataset(BaseModel, Generic[InputsT, OutputT, MetadataT], extra='forbid', a
         Returns:
             A dictionary representing the JSON schema.
         """
-        # Note: this function could maybe be simplified now that Evaluators are always dataclasses
-        registry = _get_registry(custom_evaluator_types)
+        registry = _get_registry(custom_evaluator_types, Evaluator, DEFAULT_EVALUATORS)
+        experiment_registry = _get_registry(
+            [t for t in custom_evaluator_types if issubclass(t, ExperimentEvaluator)], ExperimentEvaluator
+        )
 
-        evaluator_schema_types: list[Any] = []
-        for name, evaluator_class in registry.items():
-            type_hints = _typing_extra.get_function_type_hints(evaluator_class)
-            type_hints.pop('return', None)
-            required_type_hints: dict[str, Any] = {}
+        def _get_evaluator_schema_types(evaluators_dict: Mapping[str, type[Any]]) -> list[Any]:
+            schema_types: list[Any] = []
+            for name, evaluator_class in evaluators_dict.items():
+                type_hints = _typing_extra.get_function_type_hints(evaluator_class)
+                type_hints.pop('return', None)
+                required_type_hints: dict[str, Any] = {}
 
-            for p in inspect.signature(evaluator_class).parameters.values():
-                type_hints.setdefault(p.name, Any)
-                if p.default is not p.empty:
-                    type_hints[p.name] = NotRequired[type_hints[p.name]]
-                else:
-                    required_type_hints[p.name] = type_hints[p.name]
+                for p in inspect.signature(evaluator_class).parameters.values():
+                    type_hints.setdefault(p.name, Any)
+                    if p.default is not p.empty:
+                        type_hints[p.name] = NotRequired[type_hints[p.name]]
+                    else:
+                        required_type_hints[p.name] = type_hints[p.name]
 
-            def _make_typed_dict(cls_name_prefix: str, fields: dict[str, Any]) -> Any:
-                td = TypedDict(f'{cls_name_prefix}_{name}', fields)  # pyright: ignore[reportArgumentType]
-                config = ConfigDict(extra='forbid', arbitrary_types_allowed=True)
-                # TODO: Replace with pydantic.with_config once pydantic 2.11 is the min supported version
-                td.__pydantic_config__ = config  # pyright: ignore[reportAttributeAccessIssue]
-                return td
+                def _make_typed_dict(cls_name_prefix: str, fields: dict[str, Any]) -> Any:
+                    td = TypedDict(f'{cls_name_prefix}_{name}', fields)  # pyright: ignore[reportArgumentType]
+                    config = ConfigDict(extra='forbid', arbitrary_types_allowed=True)
+                    td.__pydantic_config__ = config  # pyright: ignore[reportAttributeAccessIssue]
+                    return td
 
-            # Shortest form: just the call name
-            if len(type_hints) == 0 or not required_type_hints:
-                evaluator_schema_types.append(Literal[name])
+                if len(type_hints) == 0 or not required_type_hints:
+                    schema_types.append(Literal[name])
 
-            # Short form: can be called with only one parameter
-            if len(type_hints) == 1:
-                [type_hint_type] = type_hints.values()
-                evaluator_schema_types.append(_make_typed_dict('short_evaluator', {name: type_hint_type}))
-            elif len(required_type_hints) == 1:  # pragma: no branch
-                [type_hint_type] = required_type_hints.values()
-                evaluator_schema_types.append(_make_typed_dict('short_evaluator', {name: type_hint_type}))
+                if len(type_hints) == 1:
+                    [type_hint_type] = type_hints.values()
+                    schema_types.append(_make_typed_dict('short_evaluator', {name: type_hint_type}))
+                elif len(required_type_hints) == 1:
+                    [type_hint_type] = required_type_hints.values()
+                    schema_types.append(_make_typed_dict('short_evaluator', {name: type_hint_type}))
 
-            # Long form: multiple parameters, possibly required
-            if len(type_hints) > 1:
-                params_td = _make_typed_dict('evaluator_params', type_hints)
-                evaluator_schema_types.append(_make_typed_dict('evaluator', {name: params_td}))
+                if len(type_hints) > 1:
+                    params_td = _make_typed_dict('evaluator_params', type_hints)
+                    schema_types.append(_make_typed_dict('evaluator', {name: params_td}))
+            return schema_types
+
+        evaluator_schema_types = _get_evaluator_schema_types(registry)
+        experiment_evaluator_schema_types = _get_evaluator_schema_types(experiment_registry)
 
         in_type, out_type, meta_type = cls._params()
 
-        # Note: we shadow the `Case` and `Dataset` class names here to generate a clean JSON schema
-        class Case(BaseModel, extra='forbid'):  # pyright: ignore[reportUnusedClass]  # this _is_ used below, but pyright doesn't seem to notice..
+        class Case(BaseModel, extra='forbid'):
             name: str | None = None
             inputs: in_type  # pyright: ignore[reportInvalidTypeForm]
             metadata: meta_type | None = None  # pyright: ignore[reportInvalidTypeForm]
             expected_output: out_type | None = None  # pyright: ignore[reportInvalidTypeForm]
-            if evaluator_schema_types:  # pragma: no branch
+            if evaluator_schema_types:
                 evaluators: list[Union[tuple(evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
 
         class Dataset(BaseModel, extra='forbid'):
             name: str | None = None
             cases: list[Case]
-            if evaluator_schema_types:  # pragma: no branch
+            if evaluator_schema_types:
                 evaluators: list[Union[tuple(evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+            if experiment_evaluator_schema_types:
+                experiment_evaluators: list[Union[tuple(experiment_evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
 
         json_schema = Dataset.model_json_schema()
-        # See `_add_json_schema` below, since `$schema` is added to the JSON, it has to be supported in the JSON
         json_schema['properties']['$schema'] = {'type': 'string'}
         return json_schema
 
@@ -1158,50 +1218,61 @@ def _get_span_duration(span: logfire_api.LogfireSpan, fallback: float) -> float:
         return fallback
 
 
+
+EvaluatorT = TypeVar('EvaluatorT', bound=Union[Evaluator, ExperimentEvaluator])
+
+
 def _get_registry(
-    custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]],
-) -> Mapping[str, type[Evaluator[InputsT, OutputT, MetadataT]]]:
+    custom_evaluator_types: Sequence[type[EvaluatorT]],
+    base_class: type[EvaluatorT],
+    default_evaluators: Sequence[type[EvaluatorT]] = (),
+) -> Mapping[str, type[EvaluatorT]]:
     """Create a registry of evaluator types from default and custom evaluators.
 
     Args:
         custom_evaluator_types: Additional evaluator classes to include in the registry.
+        base_class: The base class that all evaluators in the registry must inherit from.
+        default_evaluators: Default evaluator classes to include in the registry.
 
     Returns:
         A mapping from evaluator names to evaluator classes.
     """
-    registry: dict[str, type[Evaluator[InputsT, OutputT, MetadataT]]] = {}
+    registry: dict[str, type[EvaluatorT]] = {}
 
     for evaluator_class in custom_evaluator_types:
-        if not issubclass(evaluator_class, Evaluator):
-            raise ValueError(
-                f'All custom evaluator classes must be subclasses of Evaluator, but {evaluator_class} is not'
-            )
+        if not issubclass(evaluator_class, base_class):
+            # If we're looking for Evaluators but got an ExperimentEvaluator (or vice versa),
+            # we skip it here as it's handled by the other registry call.
+            # But if it's NEITHER, we must raise an error as the original tests expect.
+            if issubclass(evaluator_class, (Evaluator, ExperimentEvaluator)):
+                continue
+            raise ValueError(f'All custom evaluator classes must be subclasses of {base_class.__name__}')
+
         if '__dataclass_fields__' not in evaluator_class.__dict__:
-            raise ValueError(
-                f'All custom evaluator classes must be decorated with `@dataclass`, but {evaluator_class} is not'
-            )
+            raise ValueError(f'All custom evaluator classes must be decorated with `@dataclass`, but {evaluator_class} is not')
+
         name = evaluator_class.get_serialization_name()
         if name in registry:
             raise ValueError(f'Duplicate evaluator class name: {name!r}')
         registry[name] = evaluator_class
 
-    for evaluator_class in DEFAULT_EVALUATORS:
-        # Allow overriding the default evaluators with custom evaluators raising an error
+    for evaluator_class in default_evaluators:
+        # Allow overriding the default evaluators with custom evaluators without raising an error
         registry.setdefault(evaluator_class.get_serialization_name(), evaluator_class)
 
     return registry
 
 
 def _load_evaluator_from_registry(
-    registry: Mapping[str, type[Evaluator[InputsT, OutputT, MetadataT]]],
-    case_name: str | None,
+    registry: Mapping[str, type[EvaluatorT]],
+    context_desc: str,
     spec: EvaluatorSpec,
-) -> Evaluator[InputsT, OutputT, MetadataT]:
+) -> EvaluatorT:
     """Load an evaluator from the registry based on a specification.
 
     Args:
         registry: Mapping from evaluator names to evaluator classes.
-        case_name: Name of the case this evaluator will be used for, or None for dataset-level evaluators.
+        context_desc: Description of the context this evaluator will be used for (e.g. 'case1' or 'dataset').
         spec: Specification of the evaluator to load.
 
     Returns:
@@ -1212,12 +1283,12 @@ def _load_evaluator_from_registry(
     """
     evaluator_class = registry.get(spec.name)
     if evaluator_class is None:
+        valid_choices = list(registry.keys())
         raise ValueError(
-            f'Evaluator {spec.name!r} is not in the provided `custom_evaluator_types`. Valid choices: {list(registry.keys())}.'
+            f'Evaluator {spec.name!r} is not in the provided `custom_evaluator_types`. Valid choices: {valid_choices}.'
             f' If you are trying to use a custom evaluator, you must include its type in the `custom_evaluator_types` argument.'
         )
     try:
         return evaluator_class(*spec.args, **spec.kwargs)
     except Exception as e:
-        case_detail = f'case {case_name!r}' if case_name is not None else 'dataset'
-        raise ValueError(f'Failed to instantiate evaluator {spec.name!r} for {case_detail}: {e}') from e
+        raise ValueError(f'Failed to instantiate evaluator {spec.name!r} for {context_desc}: {e}') from e

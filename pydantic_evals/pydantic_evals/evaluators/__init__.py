@@ -9,7 +9,15 @@ from .common import (
     OutputConfig,
 )
 from .context import EvaluatorContext
-from .evaluator import EvaluationReason, EvaluationResult, Evaluator, EvaluatorFailure, EvaluatorOutput, EvaluatorSpec
+from .evaluator import (
+    EvaluationReason,
+    EvaluationResult,
+    Evaluator,
+    ExperimentEvaluator,
+    EvaluatorFailure,
+    EvaluatorOutput,
+    EvaluatorSpec,
+)
 
 __all__ = (
     # common
@@ -25,11 +33,11 @@ __all__ = (
     'EvaluatorContext',
     # evaluator
     'Evaluator',
+    'ExperimentEvaluator',
     'EvaluationReason',
     'EvaluatorFailure',
     'EvaluatorOutput',
     'EvaluatorSpec',
-    'EvaluationReason',
     'EvaluationResult',
 )
 

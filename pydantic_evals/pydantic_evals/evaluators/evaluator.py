@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import inspect
 from abc import ABCMeta, abstractmethod
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import MISSING, dataclass, fields
-from typing import Any, Generic, cast
+from typing import TYPE_CHECKING, Any, Generic, cast
 
 from pydantic import (
     ConfigDict,
@@ -20,11 +20,15 @@ from .._utils import get_event_loop
 from .context import EvaluatorContext
 from .spec import EvaluatorSpec
 
+if TYPE_CHECKING:
+    from ..reporting import ReportCase
+
 __all__ = (
     'EvaluationReason',
     'EvaluationResult',
     'EvaluationScalar',
     'Evaluator',
+    'ExperimentEvaluator',
     'EvaluatorFailure',
     'EvaluatorOutput',
     'EvaluatorSpec',
@@ -282,6 +286,154 @@ class Evaluator(Generic[InputsT, OutputT, MetadataT], metaclass=_StrictABCMeta):
 
         Evaluators are serialized for inclusion as the "source" in an `EvaluationResult`.
         If you want to modify how the evaluator is serialized for that or other purposes, you can override this method.
+
+        Returns:
+            A dictionary of arguments to be used during serialization.
+        """
+        raw_arguments: dict[str, Any] = {}
+        for field in fields(self):
+            value = getattr(self, field.name)
+            # always exclude defaults:
+            if field.default is not MISSING:
+                if value == field.default:
+                    continue
+            if field.default_factory is not MISSING:
+                if value == field.default_factory():  # pragma: no branch
+                    continue
+            raw_arguments[field.name] = value
+        return raw_arguments
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+
+@dataclass(repr=False)
+class ExperimentEvaluator(Generic[InputsT, OutputT, MetadataT], metaclass=_StrictABCMeta):
+    """Base class for all experiment-level evaluators.
+
+    Experiment evaluators assess the performance of a task across an entire experiment,
+    having access to all case results.
+
+    Subclasses must implement the `evaluate_experiment` method. Note it can be defined with
+    either `def` or `async def`.
+
+    Example:
+    ```python
+    from dataclasses import dataclass
+    from typing import Sequence
+    from pydantic_evals.evaluators import ExperimentEvaluator
+    from pydantic_evals.reporting import ReportCase
+
+    @dataclass
+    class Precision(ExperimentEvaluator):
+        def evaluate_experiment(self, cases: Sequence[ReportCase]) -> float:
+            passing = sum(1 for c in cases if all(a.value for a in c.assertions.values()))
+            return passing / len(cases) if cases else 0.0
+    ```
+    """
+
+    __pydantic_config__ = ConfigDict(arbitrary_types_allowed=True)
+
+    @classmethod
+    def get_serialization_name(cls) -> str:
+        """Return the 'name' of this ExperimentEvaluator to use during serialization.
+
+        Returns:
+            The name of the ExperimentEvaluator, which is typically the class name.
+        """
+        return cls.__name__
+
+    def get_default_evaluation_name(self) -> str:
+        """Return the default name to use in reports for the output of this evaluator.
+
+        By default, if the evaluator has an attribute called `evaluation_name` of type string, that will be used.
+        Otherwise, the serialization name of the evaluator (which is usually the class name) will be used.
+        """
+        evaluation_name = getattr(self, 'evaluation_name', None)
+        if isinstance(evaluation_name, str):
+            return evaluation_name
+
+        return self.get_serialization_name()
+
+    @abstractmethod
+    def evaluate_experiment(
+        self, cases: Sequence[ReportCase[InputsT, OutputT, MetadataT]]
+    ) -> EvaluatorOutput | Awaitable[EvaluatorOutput]:  # pragma: no cover
+        """Evaluate the experiment results.
+
+        This is the main evaluation method that subclasses must implement. It can be either synchronous
+        or asynchronous, returning either an EvaluatorOutput directly or an Awaitable[EvaluatorOutput].
+
+        Args:
+            cases: The results of all cases in the experiment.
+
+        Returns:
+            The evaluation result, which can be a scalar value, an EvaluationReason, or a mapping
+            of evaluation names to either of those.
+        """
+        raise NotImplementedError('You must implement `evaluate_experiment`.')
+
+    def evaluate_experiment_sync(
+        self, cases: Sequence[ReportCase[InputsT, OutputT, MetadataT]]
+    ) -> EvaluatorOutput:
+        """Run the evaluator synchronously.
+
+        Args:
+            cases: The results of all cases in the experiment.
+
+        Returns:
+            The evaluation result.
+        """
+        output = self.evaluate_experiment(cases)
+        if inspect.iscoroutine(output):  # pragma: no cover
+            return get_event_loop().run_until_complete(output)
+        else:
+            return cast(EvaluatorOutput, output)
+
+    async def evaluate_experiment_async(
+        self, cases: Sequence[ReportCase[InputsT, OutputT, MetadataT]]
+    ) -> EvaluatorOutput:
+        """Run the evaluator asynchronously.
+
+        Args:
+            cases: The results of all cases in the experiment.
+
+        Returns:
+            The evaluation result.
+        """
+        output = self.evaluate_experiment(cases)
+        if inspect.iscoroutine(output):
+            return await output
+        else:
+            return cast(EvaluatorOutput, output)
+
+    @model_serializer(mode='plain')
+    def serialize(self, info: SerializationInfo) -> Any:
+        """Serialize this Evaluator to a JSON-serializable form.
+
+        Returns:
+            A JSON-serializable representation of this evaluator as an EvaluatorSpec.
+        """
+        return to_jsonable_python(
+            self.as_spec(),
+            context=info.context,
+            serialize_unknown=True,
+        )
+
+    def as_spec(self) -> EvaluatorSpec:
+        raw_arguments = self.build_serialization_arguments()
+
+        arguments: None | tuple[Any,] | dict[str, Any]
+        if len(raw_arguments) == 0:
+            arguments = None
+        elif len(raw_arguments) == 1:
+            arguments = (next(iter(raw_arguments.values())),)
+        else:
+            arguments = raw_arguments
+
+        return EvaluatorSpec(name=self.get_serialization_name(), arguments=arguments)
+
+    def build_serialization_arguments(self) -> dict[str, Any]:
+        """Build the arguments for serialization.
 
         Returns:
             A dictionary of arguments to be used during serialization.

@@ -202,6 +202,15 @@ class EvaluationReport(Generic[InputsT, OutputT, MetadataT]):
 
     experiment_metadata: dict[str, Any] | None = None
     """Metadata associated with the specific experiment represented by this report."""
+    experiment_scores: dict[str, EvaluationResult[int | float]] = field(default_factory=dict)
+    """Scores (numeric results) from experiment-level evaluators."""
+    experiment_labels: dict[str, EvaluationResult[str]] = field(default_factory=dict)
+    """Labels (string results) from experiment-level evaluators."""
+    experiment_assertions: dict[str, EvaluationResult[bool]] = field(default_factory=dict)
+    """Assertions (boolean results) from experiment-level evaluators."""
+    experiment_evaluator_failures: list[EvaluatorFailure] = field(default_factory=list)
+    """Failures from experiment-level evaluators."""
+
     trace_id: str | None = None
     """The trace ID of the evaluation."""
     span_id: str | None = None
@@ -906,6 +915,42 @@ class ReportCaseRenderer:
 
         return row
 
+    def build_experiment_metrics_row(self, report: EvaluationReport) -> list[str]:
+        """Build a table row for experiment-level metrics."""
+        row = [f'[b i]Experiment Metrics[/]']
+
+        if self.include_input:
+            row.append(EMPTY_AGGREGATE_CELL_STR)
+
+        if self.include_metadata:
+            row.append(EMPTY_AGGREGATE_CELL_STR)
+
+        if self.include_expected_output:
+            row.append(EMPTY_AGGREGATE_CELL_STR)
+
+        if self.include_output:
+            row.append(EMPTY_AGGREGATE_CELL_STR)
+
+        if self.include_scores:
+            row.append(self._render_dict(report.experiment_scores, self.score_renderers))
+
+        if self.include_labels:
+            row.append(self._render_dict(report.experiment_labels, self.label_renderers))
+
+        if self.include_metrics:
+            row.append(EMPTY_AGGREGATE_CELL_STR)
+
+        if self.include_assertions:
+            row.append(self._render_assertions(list(report.experiment_assertions.values())))
+
+        if self.include_evaluator_failures:
+            row.append(self._render_evaluator_failures(report.experiment_evaluator_failures))
+
+        if self.include_durations:
+            row.append(EMPTY_AGGREGATE_CELL_STR)
+
+        return row
+
     def build_diff_row(
         self,
         new_case: ReportCase,
@@ -1301,6 +1346,9 @@ class EvaluationRenderer:
             if average:  # pragma: no branch
                 table.add_row(*case_renderer.build_aggregate_row(average))
 
+        if report.experiment_scores or report.experiment_labels or report.experiment_assertions:
+            table.add_row(*case_renderer.build_experiment_metrics_row(report))
+
         return table
 
     # TODO(DavidM): in v2, change the return type here to RenderableType
@@ -1375,11 +1423,17 @@ class EvaluationRenderer:
     def _infer_score_renderers(
         self, report: EvaluationReport, baseline: EvaluationReport | None
     ) -> dict[str, _NumberRenderer]:
-        all_cases = self._all_cases(report, baseline)
-
         values_by_name: dict[str, list[float | int]] = {}
-        for case in all_cases:
+        for case in report.cases:
             for k, score in case.scores.items():
+                values_by_name.setdefault(k, []).append(score.value)
+        for k, score in report.experiment_scores.items():
+            values_by_name.setdefault(k, []).append(score.value)
+        if baseline:
+            for case in baseline.cases:
+                for k, score in case.scores.items():
+                    values_by_name.setdefault(k, []).append(score.value)
+            for k, score in baseline.experiment_scores.items():
                 values_by_name.setdefault(k, []).append(score.value)
 
         all_renderers: dict[str, _NumberRenderer] = {}
@@ -1392,10 +1446,17 @@ class EvaluationRenderer:
     def _infer_label_renderers(
         self, report: EvaluationReport, baseline: EvaluationReport | None
     ) -> dict[str, _ValueRenderer]:
-        all_cases = self._all_cases(report, baseline)
         all_names: set[str] = set()
-        for case in all_cases:
+        for case in report.cases:
             for k in case.labels:
+                all_names.add(k)
+        for k in report.experiment_labels:
+            all_names.add(k)
+        if baseline:
+            for case in baseline.cases:
+                for k in case.labels:
+                    all_names.add(k)
+            for k in baseline.experiment_labels:
                 all_names.add(k)
 
         all_renderers: dict[str, _ValueRenderer] = {}
